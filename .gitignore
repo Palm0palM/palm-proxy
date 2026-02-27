@@ -1,0 +1,15 @@
+# 编辑器/IDE配置文件
+.idea/
+.vscode/
+
+# Build 文件
+bin/
+obj/
+target/
+
+# 二进制文件
+*.exe
+*.test
+
+# 备份文件
+*~

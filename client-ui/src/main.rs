@@ -4,12 +4,17 @@ use std::path::Path;
 use dotenvy::from_path;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf, tcp::OwnedReadHalf};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+// 发送时，每个 Chunk 最大明文大小为16KB
+const MAX_PAYLOAD_SIZE: usize = 16384;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
+    from_path(Path::new("../shared/.env"))?;
+
     // 监听本地端口
     let listener = TcpListener::bind("127.0.0.1:1080").await?;
     println!("SOCKS5 代理已启动，监听在 127.0.0.1:1080...");
@@ -49,7 +54,7 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let ver = header[0];
     let cmd = header[1];
     let atyp = header[3];
-    let mut len: u8;
+    let len: u8;
 
     // 版本号必须是 0x05，且命令必须是 0x01 (CONNECT)
     if ver != 0x05 || cmd != 0x01 {
@@ -97,12 +102,11 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     conn.write_all(&reply).await?;
 
-    from_path(Path::new("../shared/.env"))?;
     let vps_addr = env::var("VPS_ADDR")?;
 
     // 连接VPS
     let mut target_conn = TcpStream::connect(&vps_addr).await?;
-    
+
     /* 先发送协议头：
      * 1 byte: 地址类型 0x01 v4 0x02 domain 0x03 v6
      * 1 byte: 地址长度
@@ -117,25 +121,123 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     header_buf.extend_from_slice(addr_bytes);
     header_buf.extend_from_slice(&port.to_be_bytes());
 
-    // 发送协议头
-    target_conn.write_all(&header_buf).await?;
-
     // 建立双向数据通道
-    let (mut client_read, mut client_write) = tokio::io::split(&mut conn);
-    let (mut target_read, mut target_write) = tokio::io::split(&mut target_conn);
+    let (mut client_read, mut client_write) = conn.into_split();
+    let (mut target_read, mut target_write) = target_conn.into_split();
+
+    // 初始化计数器 每个新的 TCP 连接从 0 开始
+    let mut send_counter: u64 = 0;
+    let mut receive_counter: u64 = 0;
+
+    // 从密码字节数组生成 Key
+    let aead_key = env::var("AEAD_KEY")?;
+    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, aead_key.as_bytes()).unwrap();
+    let less_safe_key = LessSafeKey::new(unbound_key);
+
+    // 发送协议头
+    write_encrypted_frame(&mut target_write, &less_safe_key, &mut send_counter, &header_buf).await?;
 
     let client_to_target = async {
-        tokio::io::copy(&mut client_read, &mut target_write).await?;
+        let mut buf = [0u8; 8192]; // 从本地 SOCKS5 客户端读取的缓冲区
+        loop {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let data_slice = &buf[..n];
+                    write_encrypted_frame(&mut target_write, &less_safe_key, &mut send_counter, data_slice).await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok::<(), Box<dyn Error + Send + Sync>>(())
     };
 
     let target_to_client = async {
-        tokio::io::copy(&mut target_read, &mut client_write).await?;
+        loop {
+            match read_encrypted_frame_and_forward(&mut target_read, &less_safe_key, &mut receive_counter, &mut client_write).await {
+                Ok(true) => continue, // 成功读取一帧，继续等下一帧
+                Ok(false) => break,   // 正常收到 EOF，退出循环
+                Err(e) => return Err(e),
+            }
+        }
         Ok::<(), Box<dyn Error + Send + Sync>>(())
     };
 
     tokio::try_join!(client_to_target, target_to_client)?;
     Ok(())
+}
+
+fn generate_nonce_from_counter(counter: u64) -> Nonce {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
+    Nonce::assume_unique_for_key(nonce_bytes)
+}
+
+async fn write_encrypted_frame(
+    writer: &mut OwnedWriteHalf,
+    key: &LessSafeKey,
+    counter: &mut u64,
+    payload: &[u8],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for chunk in payload.chunks(MAX_PAYLOAD_SIZE) {
+        let chunk_len = chunk.len() as u16;
+
+        // 加密并发送长度头部 (18 bytes)
+        let mut len_buf = chunk_len.to_be_bytes().to_vec();
+        let nonce_len = generate_nonce_from_counter(*counter);
+        *counter += 1;
+
+        key.seal_in_place_append_tag(nonce_len, Aad::empty(), &mut len_buf)
+            .map_err(|_| "长度头部加密失败")?;
+        writer.write_all(&len_buf).await?;
+
+        // 加密并发送实际数据块
+        let mut payload_buf = chunk.to_vec();
+        let nonce_payload = generate_nonce_from_counter(*counter);
+        *counter += 1;
+
+        key.seal_in_place_append_tag(nonce_payload, Aad::empty(), &mut payload_buf)
+            .map_err(|_| "数据负载加密失败")?;
+        writer.write_all(&payload_buf).await?;
+    }
+
+    Ok(())
+}
+async fn read_encrypted_frame_and_forward(
+    reader: &mut OwnedReadHalf,
+    key: &LessSafeKey,
+    counter: &mut u64,
+    client_writer: &mut OwnedWriteHalf,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let mut len_buf = [0u8; 18];
+
+    // 如果刚准备读取下一个帧的长度时就遇到了 EOF，说明对方正常关闭了连接
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {},
+        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+
+    let nonce_len = generate_nonce_from_counter(*counter);
+    *counter += 1;
+
+    let plain_text = key.open_in_place(nonce_len, Aad::empty(), &mut len_buf)
+        .map_err(|_| "头部 AEAD 解密失败")?;
+
+    let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
+
+    let mut payload_buf = vec![0u8; (payload_len + 16) as usize];
+    reader.read_exact(&mut payload_buf).await?;
+
+    let nonce_payload = generate_nonce_from_counter(*counter);
+    *counter += 1;
+
+    let real_payload = key.open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
+        .map_err(|_| "负载 AEAD 解密失败")?;
+
+    client_writer.write_all(real_payload).await?;
+
+    Ok(true) // 返回 true 表示成功处理了一个帧，可以继续循环
 }
 
 

@@ -1,85 +1,205 @@
 package main
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
+
+	"github.com/joho/godotenv"
+	_ "github.com/joho/godotenv"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 func main() {
-	listener, err := net.Listen("tcp", ":8080")
+	err := godotenv.Load()
 	if err != nil {
-		log.Fatalf("8080端口监听失败: %v", err)
+		log.Fatalf("加载.env文件失败：%v", err)
+	}
+
+	listener, err := net.Listen("tcp", "0.0.0.0:8080")
+	if err != nil {
+		log.Fatalf("端口监听失败: %v", err)
 	}
 	defer listener.Close()
+	log.Println("服务端已启动，等待客户端连接...")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("接收连接失败：%v", err)
 			continue
 		}
-
 		go handleConnection(conn)
 	}
 }
 
-/* 标准：
- * 1 byte: 地址类型 0x01 v4 0x02 domain 0x03 v6
- * 1 byte: 地址长度
- * len byte: 地址
- * 2 byte: 端口
- * n byte: 正文
- */
-
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// 读取地址类型和长度
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil {
+	keyStr := os.Getenv("AEAD_KEY")
+	if len(keyStr) != 32 {
+		log.Println("密钥长度错误，必须为 32 字节")
 		return
 	}
-	addrLen := buf[1]
 
-	// 读取目标地址（IP 或域名）
-	addrBuf := make([]byte, addrLen)
-	if _, err := io.ReadFull(conn, addrBuf); err != nil {
+	aead, err := chacha20poly1305.New([]byte(keyStr))
+	if err != nil {
+		log.Printf("AEAD 初始化失败: %v", err)
 		return
 	}
-	targetAddrStr := string(addrBuf)
 
-	// 读取目标端口
-	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, portBuf); err != nil {
+	var recvCounter uint64 = 0
+	var sendCounter uint64 = 0
+
+	// 读取并解密第一个帧
+	headerPayload, err := readEncryptedFrame(conn, aead, &recvCounter)
+	if err != nil {
+		// 如果解密失败，直接 Return 掐断连接
+		log.Printf("读取协议头失败: %v", err)
 		return
 	}
+
+	// 解析协议头
+	if len(headerPayload) < 4 {
+		return
+	}
+
+	addrLen := int(headerPayload[1])
+	// 边界检查，防止恶意构造的头部导致索引越界 Panic
+	if len(headerPayload) < 2+addrLen+2 {
+		return
+	}
+
+	addrStr := string(headerPayload[2 : 2+addrLen])
+	portBuf := headerPayload[2+addrLen : 2+addrLen+2]
 	port := binary.BigEndian.Uint16(portBuf)
 
-	// 拼接目标地址字符串 (无需手动执行 DNS 查询逻辑)
-	target_addr := net.JoinHostPort(targetAddrStr, strconv.Itoa(int(port)))
+	targetAddr := net.JoinHostPort(addrStr, strconv.Itoa(int(port)))
+	log.Printf("客户端请求访问: %s", targetAddr)
 
-	// 连接目标网站
-	target, err := net.Dial("tcp", target_addr)
+	// 代替客户端发起连接
+	target, err := net.Dial("tcp", targetAddr)
 	if err != nil {
-		log.Printf("连接目标服务器 %s 失败: %v", target_addr, err)
+		log.Printf("连接目标失败: %v", err)
 		return
 	}
 	defer target.Close()
 
+	// 双工加密转发管道
 	errChan := make(chan error, 2)
 
 	go func() {
-		_, err := io.Copy(conn, target)
-		errChan <- err
+		buf := make([]byte, 32768)
+		for {
+			n, err := target.Read(buf)
+			if n > 0 {
+				if writeErr := writeEncryptedFrame(conn, aead, &sendCounter, buf[:n]); writeErr != nil {
+					errChan <- writeErr
+					return
+				}
+			}
+			if err != nil {
+				errChan <- err
+				return
+			}
+		}
 	}()
 
 	go func() {
-		_, err := io.Copy(target, conn)
-		errChan <- err
+		for {
+			plainPayload, err := readEncryptedFrame(conn, aead, &recvCounter)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if _, err := target.Write(plainPayload); err != nil {
+				errChan <- err
+				return
+			}
+		}
 	}()
 
+	// 阻塞等待，任意一端断开，整个函数退出触发 defer 回收
 	<-errChan
+}
+
+func generateNonce(counter uint64) []byte {
+	nonce := make([]byte, chacha20poly1305.NonceSize) // 12 bytes
+	// 将计数器放入 Nonce 的后 8 个字节
+	binary.BigEndian.PutUint64(nonce[4:], counter)
+	return nonce
+}
+
+func readEncryptedFrame(reader io.Reader, aead cipher.AEAD, counter *uint64) ([]byte, error) {
+	lenBuf := make([]byte, 18)
+	if _, err := io.ReadFull(reader, lenBuf); err != nil {
+		return nil, err // 此处返回 EOF 属于正常断开
+	}
+
+	nonceLen := generateNonce(*counter)
+	*counter++
+
+	plainLenBuf, err := aead.Open(nil, nonceLen, lenBuf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("头部解密失败 (可能被探测或篡改): %v", err)
+	}
+
+	payloadLen := binary.BigEndian.Uint16(plainLenBuf)
+
+	// 读取加密的数据负载
+	payloadBuf := make([]byte, payloadLen+16)
+	if _, err := io.ReadFull(reader, payloadBuf); err != nil {
+		return nil, err
+	}
+
+	noncePayload := generateNonce(*counter)
+	*counter++
+
+	plainPayload, err := aead.Open(nil, noncePayload, payloadBuf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("数据解密失败: %v", err)
+	}
+
+	return plainPayload, nil
+}
+
+func writeEncryptedFrame(writer io.Writer, aead cipher.AEAD, counter *uint64, payload []byte) error {
+	const maxPayloadSize = 16384 // 最大 Chunk 大小限制 (16KB)
+
+	for len(payload) > 0 {
+		chunkSize := len(payload)
+		if chunkSize > maxPayloadSize {
+			chunkSize = maxPayloadSize
+		}
+
+		chunk := payload[:chunkSize]
+		payload = payload[chunkSize:]
+
+		// 加密并发送长度头部
+		plainLenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(plainLenBuf, uint16(chunkSize))
+
+		nonceLen := generateNonce(*counter)
+		*counter++
+
+		encLen := aead.Seal(nil, nonceLen, plainLenBuf, nil)
+
+		if _, err := writer.Write(encLen); err != nil {
+			return err
+		}
+
+		// 加密并发送数据负载
+		noncePayload := generateNonce(*counter)
+		*counter++
+		encPayload := aead.Seal(nil, noncePayload, chunk, nil)
+
+		if _, err := writer.Write(encPayload); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -13,7 +13,7 @@ const MAX_PAYLOAD_SIZE: usize = 16384;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    from_path(Path::new("../shared/.env"))?;
+    dotenvy::dotenv().ok();
 
     // 监听本地端口
     let listener = TcpListener::bind("127.0.0.1:1080").await?;

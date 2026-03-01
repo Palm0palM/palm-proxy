@@ -1,11 +1,15 @@
 use std::error::Error;
-use std::io;
+use std::env;
+use std::path::Path;
+use dotenvy::from_path;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> AppResult<()> {
     // 监听本地端口
     let listener = TcpListener::bind("127.0.0.1:1080").await?;
     println!("SOCKS5 代理已启动，监听在 127.0.0.1:1080...");
@@ -21,7 +25,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn handle_connection(mut conn: TcpStream) -> Result<(), Box<dyn Error>> {
+async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let mut buf = [0u8; 2];
     conn.read_exact(&mut buf).await?;
 
@@ -45,6 +49,7 @@ async fn handle_connection(mut conn: TcpStream) -> Result<(), Box<dyn Error>> {
     let ver = header[0];
     let cmd = header[1];
     let atyp = header[3];
+    let mut len: u8;
 
     // 版本号必须是 0x05，且命令必须是 0x01 (CONNECT)
     if ver != 0x05 || cmd != 0x01 {
@@ -63,18 +68,11 @@ async fn handle_connection(mut conn: TcpStream) -> Result<(), Box<dyn Error>> {
             // 域名 会调用DNS查询
             let mut host_len = [0u8; 1];
             conn.read_exact(&mut host_len).await?;
-            let len = host_len[0] as usize;
+            len = host_len[0];
 
-            let mut host = vec![0u8; len];
+            let mut host = vec![0u8; len as usize];
             conn.read_exact(&mut host).await?;
-            let domain = String::from_utf8_lossy(&host).into_owned();
-            let mut addrs = tokio::net::lookup_host(format!("{}:0", domain)).await?;
-
-            let addr = addrs.next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "解析成功，但没有返回任何 IP")
-            })?;
-
-            addr.ip().to_string()
+            String::from_utf8_lossy(&host).into_owned()
         }
         0x04 => {
             // IPv6 地址 (16字节)
@@ -99,12 +97,45 @@ async fn handle_connection(mut conn: TcpStream) -> Result<(), Box<dyn Error>> {
     let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     conn.write_all(&reply).await?;
 
-    // 代理服务端建立与目标地址的真实 TCP 连接
-    let mut target_conn = TcpStream::connect(&dest_addr).await?;
-    println!("成功连接到目标网站: {}，开始双向转发数据...", dest_addr);
+    from_path(Path::new("../shared/.env"))?;
+    let vps_addr = env::var("VPS_ADDR")?;
+
+    // 连接VPS
+    let mut target_conn = TcpStream::connect(&vps_addr).await?;
+    
+    /* 先发送协议头：
+     * 1 byte: 地址类型 0x01 v4 0x02 domain 0x03 v6
+     * 1 byte: 地址长度
+     * len byte: 地址
+     * 2 byte: 端口
+     * n byte: 正文
+     */
+    let addr_bytes = addr.as_bytes();
+    let mut header_buf = Vec::new();
+    header_buf.push(atyp);
+    header_buf.push(addr_bytes.len() as u8);
+    header_buf.extend_from_slice(addr_bytes);
+    header_buf.extend_from_slice(&port.to_be_bytes());
+
+    // 发送协议头
+    target_conn.write_all(&header_buf).await?;
 
     // 建立双向数据通道
-    tokio::io::copy_bidirectional(&mut conn, &mut target_conn).await?;
+    let (mut client_read, mut client_write) = tokio::io::split(&mut conn);
+    let (mut target_read, mut target_write) = tokio::io::split(&mut target_conn);
 
+    let client_to_target = async {
+        tokio::io::copy(&mut client_read, &mut target_write).await?;
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    };
+
+    let target_to_client = async {
+        tokio::io::copy(&mut target_read, &mut client_write).await?;
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    };
+
+    tokio::try_join!(client_to_target, target_to_client)?;
     Ok(())
 }
+
+

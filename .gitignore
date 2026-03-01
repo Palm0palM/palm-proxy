@@ -12,6 +12,7 @@ target/
 # 二进制文件
 *.exe
 *.test
+vps_server
 
 # 备份文件
 *~

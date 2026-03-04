@@ -8,6 +8,9 @@ use ring::rand::SystemRandom;
 use ring::agreement;
 use ring::{hkdf, hkdf::Okm};
 use dotenvy;
+use tracing::{info, error, trace, Instrument};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -26,19 +29,22 @@ impl hkdf::KeyType for HkdfOutputLen {
 #[tokio::main]
 async fn main() -> AppResult<()> {
     dotenvy::dotenv().ok();
+    let _guard = init_tracing();
 
     // 监听本地端口
     let listener = TcpListener::bind("127.0.0.1:1080").await?;
-    println!("SOCKS5 代理已启动，监听在 127.0.0.1:1080...");
+    info!(addr = "127.0.0.1:1080", "SOCKS5 代理已启动");
 
     loop {
-        let (conn, _) = listener.accept().await?;
+        let (conn, peer_addr) = listener.accept().await?;
+
+        let span = tracing::info_span!("conn", src = %peer_addr);
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(conn).await {
-                eprintln!("处理连接时出错: {}", e);
+                error!(error = %e, "处理连接时出错");
             }
-        });
+        }.instrument(span));
     }
 }
 
@@ -56,7 +62,7 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let mut methods = vec![0u8; nmethods];
     conn.read_exact(&mut methods).await?;
 
-    println!("收到新的 SOCKS5 连接，支持 {} 种认证方法: {:?}", nmethods, methods);
+    info!("收到新的 SOCKS5 连接，支持 {} 种认证方法: {:?}", nmethods, methods);
 
     // 回复客户端：选择无认证方式
     conn.write_all(&[0x05, 0x00]).await?;
@@ -108,7 +114,7 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let port = u16::from_be_bytes(port_buf);
 
     let dest_addr = format!("{}:{}", addr, port);
-    println!("成功解析！客户端想要访问: {}", dest_addr);
+    info!(target = %dest_addr, "成功解析目标地址");
 
     // 回复客户端：连接成功，代理绑定地址全为 0
     let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -130,7 +136,7 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     };
 
     let less_safe_key = perform_handshake(&mut target_write, &mut target_read, &psk_bytes).await?;
-    println!("握手完成，开始使用 Session Key 转发数据...");
+    info!("握手完成，开始使用 Session Key 转发数据");
 
     /* 协议头格式：
      * 1 byte:  地址类型 (0x01=IPv4, 0x03=域名, 0x04=IPv6)
@@ -159,8 +165,12 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
         let mut buf = [0u8; 8192];
         loop {
             match client_read.read(&mut buf).await {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    info!("客户端关闭了连接 (EOF)");
+                    break;
+                }, 
                 Ok(n) => {
+                    trace!(bytes = n, "从客户端读取数据并转发");
                     write_encrypted_frame(
                         &mut target_write,
                         &less_safe_key,
@@ -183,7 +193,10 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
                 &mut client_write,
             ).await {
                 Ok(true)  => continue, // 成功读取一帧，继续等下一帧
-                Ok(false) => break,    // 正常收到 EOF，退出循环
+                Ok(false) => {
+                    info!("VPS 关闭了连接 (EOF)");
+                    break;
+                },    // 正常收到 EOF，退出循环
                 Err(e)    => return Err(e),
             }
         }
@@ -261,6 +274,7 @@ async fn read_encrypted_frame_and_forward(
         .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
         .map_err(|_| "负载 AEAD 解密失败")?;
 
+    trace!(bytes = real_payload.len(), "从 VPS 收到数据并转发给客户端");
     client_writer.write_all(real_payload).await?;
 
     Ok(true)
@@ -342,4 +356,31 @@ async fn perform_handshake(
     let final_unbound = UnboundKey::new(&CHACHA20_POLY1305, &session_key_bytes)
         .map_err(|_| "Session Key 初始化失败")?;
     Ok(LessSafeKey::new(final_unbound))
+}
+
+pub fn init_tracing() -> WorkerGuard {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,client_ui=debug"));
+
+    let stdout_layer = fmt::layer()
+        .with_ansi(true) // 开启颜色
+        .with_target(true); // 显示模块路径
+
+    let file_appender = tracing_appender::rolling::daily("./logs", "app.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // 文件层使用 JSON 格式
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .json() // 结构化输出
+        .with_ansi(false);
+
+    // 注册所有 Layer
+    Registry::default()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+
+    guard
 }

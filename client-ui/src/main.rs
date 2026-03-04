@@ -1,15 +1,27 @@
 use std::error::Error;
 use std::env;
-use std::path::Path;
-use dotenvy::from_path;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf, tcp::OwnedReadHalf};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
+use ring::rand::SystemRandom;
+use ring::agreement;
+use ring::{hkdf, hkdf::Okm};
+use dotenvy;
+
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 // 发送时，每个 Chunk 最大明文大小为16KB
 const MAX_PAYLOAD_SIZE: usize = 16384;
+
+// 用于 HKDF expand 的自定义类型，指定输出密钥长度为 32 字节
+struct HkdfOutputLen(usize);
+
+impl hkdf::KeyType for HkdfOutputLen {
+    fn len(&self) -> usize {
+        self.0
+    }
+}
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -46,6 +58,7 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
 
     println!("收到新的 SOCKS5 连接，支持 {} 种认证方法: {:?}", nmethods, methods);
 
+    // 回复客户端：选择无认证方式
     conn.write_all(&[0x05, 0x00]).await?;
 
     let mut header = [0u8; 4];
@@ -54,7 +67,6 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let ver = header[0];
     let cmd = header[1];
     let atyp = header[3];
-    let len: u8;
 
     // 版本号必须是 0x05，且命令必须是 0x01 (CONNECT)
     if ver != 0x05 || cmd != 0x01 {
@@ -70,12 +82,12 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
             Ipv4Addr::new(ipv4[0], ipv4[1], ipv4[2], ipv4[3]).to_string()
         }
         0x03 => {
-            // 域名 会调用DNS查询
-            let mut host_len = [0u8; 1];
-            conn.read_exact(&mut host_len).await?;
-            len = host_len[0];
+            // 域名，会调用 DNS 查询
+            let mut host_len_buf = [0u8; 1];
+            conn.read_exact(&mut host_len_buf).await?;
+            let host_len = host_len_buf[0] as usize;
 
-            let mut host = vec![0u8; len as usize];
+            let mut host = vec![0u8; host_len];
             conn.read_exact(&mut host).await?;
             String::from_utf8_lossy(&host).into_owned()
         }
@@ -98,21 +110,33 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
     let dest_addr = format!("{}:{}", addr, port);
     println!("成功解析！客户端想要访问: {}", dest_addr);
 
-    // 回复客户端：连接成功，代理绑定地址全为0
+    // 回复客户端：连接成功，代理绑定地址全为 0
     let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     conn.write_all(&reply).await?;
 
     let vps_addr = env::var("VPS_ADDR")?;
+    let target_conn = TcpStream::connect(&vps_addr).await?;
 
-    // 连接VPS
-    let mut target_conn = TcpStream::connect(&vps_addr).await?;
+    let (mut target_read, mut target_write) = target_conn.into_split();
 
-    /* 先发送协议头：
-     * 1 byte: 地址类型 0x01 v4 0x02 domain 0x03 v6
-     * 1 byte: 地址长度
-     * len byte: 地址
-     * 2 byte: 端口
-     * n byte: 正文
+    // 从环境变量读取 32 字节 PSK
+    let psk_raw = env::var("AEAD_KEY")?;
+    let psk_bytes = {
+        let mut arr = [0u8; 32];
+        let src = psk_raw.as_bytes();
+        let copy_len = src.len().min(32);
+        arr[..copy_len].copy_from_slice(&src[..copy_len]);
+        arr
+    };
+
+    let less_safe_key = perform_handshake(&mut target_write, &mut target_read, &psk_bytes).await?;
+    println!("握手完成，开始使用 Session Key 转发数据...");
+
+    /* 协议头格式：
+     * 1 byte:  地址类型 (0x01=IPv4, 0x03=域名, 0x04=IPv6)
+     * 1 byte:  地址长度
+     * N bytes: 地址
+     * 2 bytes: 端口 (大端序)
      */
     let addr_bytes = addr.as_bytes();
     let mut header_buf = Vec::new();
@@ -123,28 +147,26 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
 
     // 建立双向数据通道
     let (mut client_read, mut client_write) = conn.into_split();
-    let (mut target_read, mut target_write) = target_conn.into_split();
 
-    // 初始化计数器 每个新的 TCP 连接从 0 开始
+    // 初始化计数器，每个新的 TCP 连接从 0 开始
     let mut send_counter: u64 = 0;
     let mut receive_counter: u64 = 0;
 
-    // 从密码字节数组生成 Key
-    let aead_key = env::var("AEAD_KEY")?;
-    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, aead_key.as_bytes()).unwrap();
-    let less_safe_key = LessSafeKey::new(unbound_key);
-
-    // 发送协议头
+    // 发送协议头（使用 Session Key 加密）
     write_encrypted_frame(&mut target_write, &less_safe_key, &mut send_counter, &header_buf).await?;
 
     let client_to_target = async {
-        let mut buf = [0u8; 8192]; // 从本地 SOCKS5 客户端读取的缓冲区
+        let mut buf = [0u8; 8192];
         loop {
             match client_read.read(&mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    let data_slice = &buf[..n];
-                    write_encrypted_frame(&mut target_write, &less_safe_key, &mut send_counter, data_slice).await?;
+                    write_encrypted_frame(
+                        &mut target_write,
+                        &less_safe_key,
+                        &mut send_counter,
+                        &buf[..n],
+                    ).await?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -154,10 +176,15 @@ async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
 
     let target_to_client = async {
         loop {
-            match read_encrypted_frame_and_forward(&mut target_read, &less_safe_key, &mut receive_counter, &mut client_write).await {
-                Ok(true) => continue, // 成功读取一帧，继续等下一帧
-                Ok(false) => break,   // 正常收到 EOF，退出循环
-                Err(e) => return Err(e),
+            match read_encrypted_frame_and_forward(
+                &mut target_read,
+                &less_safe_key,
+                &mut receive_counter,
+                &mut client_write,
+            ).await {
+                Ok(true)  => continue, // 成功读取一帧，继续等下一帧
+                Ok(false) => break,    // 正常收到 EOF，退出循环
+                Err(e)    => return Err(e),
             }
         }
         Ok::<(), Box<dyn Error + Send + Sync>>(())
@@ -182,20 +209,18 @@ async fn write_encrypted_frame(
     for chunk in payload.chunks(MAX_PAYLOAD_SIZE) {
         let chunk_len = chunk.len() as u16;
 
-        // 加密并发送长度头部 (18 bytes)
+        // 加密并发送长度头部（2字节明文 + 16字节 tag = 18字节密文）
         let mut len_buf = chunk_len.to_be_bytes().to_vec();
         let nonce_len = generate_nonce_from_counter(*counter);
         *counter += 1;
-
         key.seal_in_place_append_tag(nonce_len, Aad::empty(), &mut len_buf)
             .map_err(|_| "长度头部加密失败")?;
         writer.write_all(&len_buf).await?;
 
-        // 加密并发送实际数据块
+        // 加密并发送实际数据块（N字节明文 + 16字节 tag）
         let mut payload_buf = chunk.to_vec();
         let nonce_payload = generate_nonce_from_counter(*counter);
         *counter += 1;
-
         key.seal_in_place_append_tag(nonce_payload, Aad::empty(), &mut payload_buf)
             .map_err(|_| "数据负载加密失败")?;
         writer.write_all(&payload_buf).await?;
@@ -203,41 +228,118 @@ async fn write_encrypted_frame(
 
     Ok(())
 }
+
 async fn read_encrypted_frame_and_forward(
     reader: &mut OwnedReadHalf,
     key: &LessSafeKey,
     counter: &mut u64,
     client_writer: &mut OwnedWriteHalf,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    // 读取 18 字节密文长度头部（2字节明文 + 16字节 tag）
     let mut len_buf = [0u8; 18];
-
-    // 如果刚准备读取下一个帧的长度时就遇到了 EOF，说明对方正常关闭了连接
     match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(e) => return Err(e.into()),
     }
 
     let nonce_len = generate_nonce_from_counter(*counter);
     *counter += 1;
-
-    let plain_text = key.open_in_place(nonce_len, Aad::empty(), &mut len_buf)
+    let plain_text = key
+        .open_in_place(nonce_len, Aad::empty(), &mut len_buf)
         .map_err(|_| "头部 AEAD 解密失败")?;
 
     let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
 
-    let mut payload_buf = vec![0u8; (payload_len + 16) as usize];
+    // 读取 payload_len + 16 字节密文数据
+    let mut payload_buf = vec![0u8; payload_len as usize + 16];
     reader.read_exact(&mut payload_buf).await?;
 
     let nonce_payload = generate_nonce_from_counter(*counter);
     *counter += 1;
-
-    let real_payload = key.open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
+    let real_payload = key
+        .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
         .map_err(|_| "负载 AEAD 解密失败")?;
 
     client_writer.write_all(real_payload).await?;
 
-    Ok(true) // 返回 true 表示成功处理了一个帧，可以继续循环
+    Ok(true)
 }
 
+async fn read_encrypted_frame(
+    reader: &mut OwnedReadHalf,
+    key: &LessSafeKey,
+    counter: &mut u64,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let mut len_buf = [0u8; 18];
+    reader.read_exact(&mut len_buf).await?;
 
+    let nonce_len = generate_nonce_from_counter(*counter);
+    *counter += 1;
+    let plain_text = key
+        .open_in_place(nonce_len, Aad::empty(), &mut len_buf)
+        .map_err(|_| "握手阶段 长度头部解密失败")?;
+
+    let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
+
+    let mut payload_buf = vec![0u8; payload_len as usize + 16];
+    reader.read_exact(&mut payload_buf).await?;
+
+    let nonce_payload = generate_nonce_from_counter(*counter);
+    *counter += 1;
+    let real_payload = key
+        .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
+        .map_err(|_| "握手阶段 数据负载解密失败")?;
+
+    Ok(real_payload.to_vec())
+}
+
+async fn perform_handshake(
+    writer: &mut OwnedWriteHalf,
+    reader: &mut OwnedReadHalf,
+    psk_bytes: &[u8; 32],
+) -> Result<LessSafeKey, Box<dyn Error + Send + Sync>> {
+    let psk_unbound = UnboundKey::new(&CHACHA20_POLY1305, psk_bytes)
+        .map_err(|_| "PSK 密钥初始化失败")?;
+    let psk_key = LessSafeKey::new(psk_unbound);
+    let mut handshake_send_counter: u64 = 0;
+    let mut handshake_recv_counter: u64 = 0;
+    
+    let rng = SystemRandom::new();
+    let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+        .map_err(|_| "生成 X25519 私钥失败")?;
+    let my_public_key = my_private_key
+        .compute_public_key()
+        .map_err(|_| "计算 X25519 公钥失败")?;
+    
+    write_encrypted_frame(writer, &psk_key, &mut handshake_send_counter, my_public_key.as_ref()).await?;
+    
+    let server_pub_key_bytes = read_encrypted_frame(reader, &psk_key, &mut handshake_recv_counter).await?;
+
+    if server_pub_key_bytes.len() != 32 {
+        return Err(format!("服务端返回的公钥长度错误，需要 32 字节，实际为 {} 字节", server_pub_key_bytes.len()).into());
+    }
+
+    let server_public_key = agreement::UnparsedPublicKey::new(&agreement::X25519, server_pub_key_bytes);
+
+    let session_key_bytes: [u8; 32] = agreement::agree_ephemeral(
+        my_private_key, &server_public_key,
+        |key_material: &[u8]| -> Result<[u8; 32], ring::error::Unspecified> {
+            let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, psk_bytes);
+            let prk = salt.extract(key_material);
+
+            let info: &[&[u8]] = &[b"palm-proxy-handshake-phase"];
+            let okm: Okm<HkdfOutputLen> = prk
+                .expand(info, HkdfOutputLen(32))?;
+
+            let mut derived_key = [0u8; 32];
+            okm.fill(&mut derived_key)?;
+
+            Ok(derived_key)
+        },
+    ).flatten().map_err(|_| "ECDH 密钥协商与 HKDF 派生失败")?;
+
+    let final_unbound = UnboundKey::new(&CHACHA20_POLY1305, &session_key_bytes)
+        .map_err(|_| "Session Key 初始化失败")?;
+    Ok(LessSafeKey::new(final_unbound))
+}

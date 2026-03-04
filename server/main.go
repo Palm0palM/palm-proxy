@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,8 +13,9 @@ import (
 	"strconv"
 
 	"github.com/joho/godotenv"
-	_ "github.com/joho/godotenv"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 func main() {
@@ -45,18 +48,21 @@ func handleConnection(conn net.Conn) {
 		log.Println("密钥长度错误，必须为 32 字节")
 		return
 	}
+	psk := []byte(keyStr)
 
-	aead, err := chacha20poly1305.New([]byte(keyStr))
+	sessionAEAD, err := performHandshake(conn, psk)
 	if err != nil {
-		log.Printf("AEAD 初始化失败: %v", err)
+		log.Printf("握手失败: %v", err)
 		return
 	}
+
+	log.Println("安全握手完成，已生成安全会话密钥！")
 
 	var recvCounter uint64 = 0
 	var sendCounter uint64 = 0
 
 	// 读取并解密第一个帧
-	headerPayload, err := readEncryptedFrame(conn, aead, &recvCounter)
+	headerPayload, err := readEncryptedFrame(conn, sessionAEAD, &recvCounter)
 	if err != nil {
 		// 如果解密失败，直接 Return 掐断连接
 		log.Printf("读取协议头失败: %v", err)
@@ -97,7 +103,7 @@ func handleConnection(conn net.Conn) {
 		for {
 			n, err := target.Read(buf)
 			if n > 0 {
-				if writeErr := writeEncryptedFrame(conn, aead, &sendCounter, buf[:n]); writeErr != nil {
+				if writeErr := writeEncryptedFrame(conn, sessionAEAD, &sendCounter, buf[:n]); writeErr != nil {
 					errChan <- writeErr
 					return
 				}
@@ -111,7 +117,7 @@ func handleConnection(conn net.Conn) {
 
 	go func() {
 		for {
-			plainPayload, err := readEncryptedFrame(conn, aead, &recvCounter)
+			plainPayload, err := readEncryptedFrame(conn, sessionAEAD, &recvCounter)
 			if err != nil {
 				errChan <- err
 				return
@@ -202,4 +208,51 @@ func writeEncryptedFrame(writer io.Writer, aead cipher.AEAD, counter *uint64, pa
 		}
 	}
 	return nil
+}
+
+func performHandshake(conn net.Conn, psk []byte) (cipher.AEAD, error) {
+	pskAEAD, err := chacha20poly1305.New(psk)
+	if err != nil {
+		return nil, err
+	}
+
+	var recvCounter uint64 = 0
+	var sendCounter uint64 = 0
+
+	clientPubKey, err := readEncryptedFrame(conn, pskAEAD, &recvCounter)
+	if err != nil {
+		return nil, fmt.Errorf("读取客户端公钥失败: %v", err)
+	}
+	if len(clientPubKey) != 32 {
+		return nil, fmt.Errorf("非法客户端公钥长度")
+	}
+
+	var myPrivateKey [32]byte
+	if _, err := io.ReadFull(rand.Reader, myPrivateKey[:]); err != nil {
+		return nil, fmt.Errorf("生成服务端私钥失败: %v", err)
+	}
+
+	myPublicKey, err := curve25519.X25519(myPrivateKey[:], curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("计算服务端公钥失败: %v", err)
+	}
+
+	if err := writeEncryptedFrame(conn, pskAEAD, &sendCounter, myPublicKey); err != nil {
+		return nil, fmt.Errorf("发送服务端公钥失败: %v", err)
+	}
+
+	sharedSecret, err := curve25519.X25519(myPrivateKey[:], clientPubKey)
+	if err != nil {
+		return nil, fmt.Errorf("计算 Shared Secret 失败: %v", err)
+	}
+
+	info := []byte("palm-proxy-handshake-phase")
+	hkdfReader := hkdf.New(sha256.New, sharedSecret, psk, info)
+
+	sessionKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdfReader, sessionKey); err != nil {
+		return nil, fmt.Errorf("HKDF 派生密钥失败: %v", err)
+	}
+
+	return chacha20poly1305.New(sessionKey)
 }

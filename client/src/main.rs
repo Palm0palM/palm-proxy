@@ -17,7 +17,7 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 // 发送时，每个 Chunk 最大明文大小为16KB
 const MAX_PAYLOAD_SIZE: usize = 16384;
 
-// 用于 HKDF expand 的自定义类型，指定输出密钥长度为 32 字节
+// 用于 HKDF expand 输出密钥长度为 32 字节
 struct HkdfOutputLen(usize);
 
 impl hkdf::KeyType for HkdfOutputLen {
@@ -28,8 +28,18 @@ impl hkdf::KeyType for HkdfOutputLen {
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    dotenvy::dotenv().ok();
     let _guard = init_tracing();
+
+    // 从环境变量读取 32 字节 PSK
+    dotenvy::dotenv().ok();
+    let psk_raw = env::var("AEAD_KEY")?;
+    let psk_bytes = {
+        let mut arr = [0u8; 32];
+        let src = psk_raw.as_bytes();
+        let copy_len = src.len().min(32);
+        arr[..copy_len].copy_from_slice(&src[..copy_len]);
+        arr
+    };
 
     // 监听本地端口
     let listener = TcpListener::bind("127.0.0.1:1080").await?;
@@ -41,172 +51,37 @@ async fn main() -> AppResult<()> {
         let span = tracing::info_span!("conn", src = %peer_addr);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(conn).await {
+            if let Err(e) = handle_connection(conn, psk_bytes).await {
                 error!(error = %e, "处理连接时出错");
             }
         }.instrument(span));
     }
 }
 
-async fn handle_connection(mut conn: TcpStream) -> AppResult<()> {
-    let mut buf = [0u8; 2];
-    conn.read_exact(&mut buf).await?;
+async fn handle_connection(conn: TcpStream, psk_bytes: [u8; 32]) -> AppResult<()> {
+    let mut peek_buf = [0u8; 1];
 
-    let version = buf[0];
-    let nmethods = buf[1] as usize;
-
-    if version != 0x05 {
-        return Err(format!("不支持的协议版本: 0x{:02x}", version).into());
+    let n = conn.peek(&mut peek_buf).await?;
+    if n == 0 {
+        return Ok(()); // 连接直接关闭
     }
 
-    let mut methods = vec![0u8; nmethods];
-    conn.read_exact(&mut methods).await?;
-
-    info!("收到新的 SOCKS5 连接，支持 {} 种认证方法: {:?}", nmethods, methods);
-
-    // 回复客户端：选择无认证方式
-    conn.write_all(&[0x05, 0x00]).await?;
-
-    let mut header = [0u8; 4];
-    conn.read_exact(&mut header).await?;
-
-    let ver = header[0];
-    let cmd = header[1];
-    let atyp = header[3];
-
-    // 版本号必须是 0x05，且命令必须是 0x01 (CONNECT)
-    if ver != 0x05 || cmd != 0x01 {
-        return Err("不支持的协议版本或命令".into());
-    }
-
-    // 解析目标地址
-    let addr: String = match atyp {
-        0x01 => {
-            // IPv4 地址 (4字节)
-            let mut ipv4 = [0u8; 4];
-            conn.read_exact(&mut ipv4).await?;
-            Ipv4Addr::new(ipv4[0], ipv4[1], ipv4[2], ipv4[3]).to_string()
+    match peek_buf[0] {
+        0x05 => {
+            // SOCKS5 协议的标志
+            info!("收到SOCKS5代理连接请求");
+            handle_socks5_proxy(conn, &psk_bytes).await
         }
-        0x03 => {
-            // 域名，会调用 DNS 查询
-            let mut host_len_buf = [0u8; 1];
-            conn.read_exact(&mut host_len_buf).await?;
-            let host_len = host_len_buf[0] as usize;
-
-            let mut host = vec![0u8; host_len];
-            conn.read_exact(&mut host).await?;
-            String::from_utf8_lossy(&host).into_owned()
-        }
-        0x04 => {
-            // IPv6 地址 (16字节)
-            let mut ipv6 = [0u8; 16];
-            conn.read_exact(&mut ipv6).await?;
-            Ipv6Addr::from(ipv6).to_string()
+        // HTTP 协议常见方法的首字母
+        b'C' | b'G' | b'P' | b'O' => {
+            info!("收到HTTPS代理连接请求");
+            handle_http_proxy(conn, &psk_bytes).await
         }
         _ => {
-            return Err(format!("不支持的地址类型: 0x{:02x}", atyp).into());
+            Err(format!("未知的协议指纹: 0x{:02x}", peek_buf[0]).into())
         }
-    };
-
-    // 读取 2 字节的目标端口 (大端序)
-    let mut port_buf = [0u8; 2];
-    conn.read_exact(&mut port_buf).await?;
-    let port = u16::from_be_bytes(port_buf);
-
-    let dest_addr = format!("{}:{}", addr, port);
-    info!(target = %dest_addr, "成功解析目标地址");
-
-    // 回复客户端：连接成功，代理绑定地址全为 0
-    let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    conn.write_all(&reply).await?;
-
-    let vps_addr = env::var("VPS_ADDR")?;
-    let target_conn = TcpStream::connect(&vps_addr).await?;
-
-    let (mut target_read, mut target_write) = target_conn.into_split();
-
-    // 从环境变量读取 32 字节 PSK
-    let psk_raw = env::var("AEAD_KEY")?;
-    let psk_bytes = {
-        let mut arr = [0u8; 32];
-        let src = psk_raw.as_bytes();
-        let copy_len = src.len().min(32);
-        arr[..copy_len].copy_from_slice(&src[..copy_len]);
-        arr
-    };
-
-    let less_safe_key = perform_handshake(&mut target_write, &mut target_read, &psk_bytes).await?;
-    info!("握手完成，开始使用 Session Key 转发数据");
-
-    /* 协议头格式：
-     * 1 byte:  地址类型 (0x01=IPv4, 0x03=域名, 0x04=IPv6)
-     * 1 byte:  地址长度
-     * N bytes: 地址
-     * 2 bytes: 端口 (大端序)
-     */
-    let addr_bytes = addr.as_bytes();
-    let mut header_buf = Vec::new();
-    header_buf.push(atyp);
-    header_buf.push(addr_bytes.len() as u8);
-    header_buf.extend_from_slice(addr_bytes);
-    header_buf.extend_from_slice(&port.to_be_bytes());
-
-    // 建立双向数据通道
-    let (mut client_read, mut client_write) = conn.into_split();
-
-    // 初始化计数器，每个新的 TCP 连接从 0 开始
-    let mut send_counter: u64 = 0;
-    let mut receive_counter: u64 = 0;
-
-    // 发送协议头（使用 Session Key 加密）
-    write_encrypted_frame(&mut target_write, &less_safe_key, &mut send_counter, &header_buf).await?;
-
-    let client_to_target = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => {
-                    info!("客户端关闭了连接 (EOF)");
-                    break;
-                }, 
-                Ok(n) => {
-                    trace!(bytes = n, "从客户端读取数据并转发");
-                    write_encrypted_frame(
-                        &mut target_write,
-                        &less_safe_key,
-                        &mut send_counter,
-                        &buf[..n],
-                    ).await?;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok::<(), Box<dyn Error + Send + Sync>>(())
-    };
-
-    let target_to_client = async {
-        loop {
-            match read_encrypted_frame_and_forward(
-                &mut target_read,
-                &less_safe_key,
-                &mut receive_counter,
-                &mut client_write,
-            ).await {
-                Ok(true)  => continue, // 成功读取一帧，继续等下一帧
-                Ok(false) => {
-                    info!("VPS 关闭了连接 (EOF)");
-                    break;
-                },    // 正常收到 EOF，退出循环
-                Err(e)    => return Err(e),
-            }
-        }
-        Ok::<(), Box<dyn Error + Send + Sync>>(())
-    };
-
-    tokio::try_join!(client_to_target, target_to_client)?;
-    Ok(())
+    }
 }
-
 fn generate_nonce_from_counter(counter: u64) -> Nonce {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
@@ -383,4 +258,164 @@ pub fn init_tracing() -> WorkerGuard {
         .init();
 
     guard
+}
+
+async fn forward_to_vps(
+    client_conn: TcpStream,
+    atyp: u8,
+    addr: String,
+    port: u16,
+    psk_bytes: &[u8; 32]
+) -> AppResult<()> {
+    let vps_addr = env::var("VPS_ADDR")?;
+    let target_conn = TcpStream::connect(&vps_addr).await?;
+    let (mut target_read, mut target_write) = target_conn.into_split();
+
+    let session_key = perform_handshake(&mut target_write, &mut target_read, &psk_bytes).await?;
+    info!("握手完成，开始使用 Session Key 转发数据");
+
+    // 构建并发送自制协议头
+    let addr_bytes = addr.as_bytes();
+    let mut header_buf = Vec::new();
+    header_buf.push(atyp);
+    header_buf.push(addr_bytes.len() as u8);
+    header_buf.extend_from_slice(addr_bytes);
+    header_buf.extend_from_slice(&port.to_be_bytes());
+
+    let mut send_counter: u64 = 0;
+    let mut receive_counter: u64 = 0;
+
+    write_encrypted_frame(&mut target_write, &session_key, &mut send_counter, &header_buf).await?;
+
+    let (mut client_read, mut client_write) = client_conn.into_split();
+
+    // 开启双向加密转发
+    let client_to_target = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    write_encrypted_frame(&mut target_write, &session_key, &mut send_counter, &buf[..n]).await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    };
+
+    let target_to_client = async {
+        loop {
+            match read_encrypted_frame_and_forward(&mut target_read, &session_key, &mut receive_counter, &mut client_write).await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    };
+
+    tokio::try_join!(client_to_target, target_to_client)?;
+    Ok(())
+}
+
+async fn handle_http_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppResult<()> {
+    let mut buf = [0u8; 4096];
+    let n = conn.read(&mut buf).await?;
+    if n == 0 { return Ok(()); }
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().ok_or("空请求")?;
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+    // 仅实现CONNECT请求
+    if parts.len() < 2 || parts[0] != "CONNECT" {
+        return Err("目前仅支持 CONNECT 代理方法".into());
+    }
+
+    let host_port = parts[1];
+    let mut split = host_port.split(':');
+    let host = split.next().ok_or("无法解析主机名")?.to_string();
+    let port: u16 = split.next().and_then(|p| p.parse().ok()).unwrap_or(443);
+
+    info!(host, port, "HTTP 嗅探成功");
+    
+    conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+    
+    forward_to_vps(conn, 0x03, host, port, psk_bytes).await
+}
+
+async fn handle_socks5_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppResult<()> {
+    let mut buf = [0u8; 2];
+    conn.read_exact(&mut buf).await?;
+
+    let version = buf[0];
+    let nmethods = buf[1] as usize;
+
+    if version != 0x05 {
+        return Err(format!("不支持的协议版本: 0x{:02x}", version).into());
+    }
+
+    let mut methods = vec![0u8; nmethods];
+    conn.read_exact(&mut methods).await?;
+
+    info!("收到新的 SOCKS5 连接，支持 {} 种认证方法: {:?}", nmethods, methods);
+
+    // 回复客户端：选择无认证方式
+    conn.write_all(&[0x05, 0x00]).await?;
+
+    let mut header = [0u8; 4];
+    conn.read_exact(&mut header).await?;
+
+    let ver = header[0];
+    let cmd = header[1];
+    let atyp = header[3];
+
+    // 版本号必须是 0x05，且命令必须是 0x01 (CONNECT)
+    if ver != 0x05 || cmd != 0x01 {
+        return Err("不支持的协议版本或命令".into());
+    }
+
+    // 解析目标地址
+    let addr: String = match atyp {
+        0x01 => {
+            // IPv4 地址 (4字节)
+            let mut ipv4 = [0u8; 4];
+            conn.read_exact(&mut ipv4).await?;
+            Ipv4Addr::new(ipv4[0], ipv4[1], ipv4[2], ipv4[3]).to_string()
+        }
+        0x03 => {
+            // 域名，会调用 DNS 查询
+            let mut host_len_buf = [0u8; 1];
+            conn.read_exact(&mut host_len_buf).await?;
+            let host_len = host_len_buf[0] as usize;
+
+            let mut host = vec![0u8; host_len];
+            conn.read_exact(&mut host).await?;
+            String::from_utf8_lossy(&host).into_owned()
+        }
+        0x04 => {
+            // IPv6 地址 (16字节)
+            let mut ipv6 = [0u8; 16];
+            conn.read_exact(&mut ipv6).await?;
+            Ipv6Addr::from(ipv6).to_string()
+        }
+        _ => {
+            return Err(format!("不支持的地址类型: 0x{:02x}", atyp).into());
+        }
+    };
+
+    // 读取 2 字节的目标端口 (大端序)
+    let mut port_buf = [0u8; 2];
+    conn.read_exact(&mut port_buf).await?;
+    let port = u16::from_be_bytes(port_buf);
+
+    let dest_addr = format!("{}:{}", addr, port);
+    info!(target = %dest_addr, "成功解析目标地址");
+
+    // 回复客户端：连接成功，代理绑定地址全为 0
+    let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    conn.write_all(&reply).await?;
+    
+    forward_to_vps(conn, atyp, addr, port, psk_bytes).await
 }

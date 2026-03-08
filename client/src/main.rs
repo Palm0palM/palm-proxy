@@ -41,8 +41,10 @@ async fn main() -> AppResult<()> {
         arr
     };
 
+    let loopback_port = env::var("LOOPBACK_PORT").unwrap_or(String::from("1080"));
+
     // 监听本地端口
-    let listener = TcpListener::bind("127.0.0.1:1080").await?;
+    let listener = TcpListener::bind("127.0.0.1:".to_string() + &loopback_port).await?;
     info!(addr = "127.0.0.1:1080", "SOCKS5 代理已启动");
 
     loop {
@@ -339,9 +341,9 @@ async fn handle_http_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppResu
     let port: u16 = split.next().and_then(|p| p.parse().ok()).unwrap_or(443);
 
     info!(host, port, "HTTP 嗅探成功");
-    
+
     conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-    
+
     forward_to_vps(conn, 0x03, host, port, psk_bytes).await
 }
 
@@ -416,6 +418,6 @@ async fn handle_socks5_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppRe
     // 回复客户端：连接成功，代理绑定地址全为 0
     let reply = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     conn.write_all(&reply).await?;
-    
+
     forward_to_vps(conn, atyp, addr, port, psk_bytes).await
 }

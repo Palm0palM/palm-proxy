@@ -61,6 +61,7 @@ async fn main() -> AppResult<()> {
 }
 
 async fn handle_connection(conn: TcpStream, psk_bytes: [u8; 32]) -> AppResult<()> {
+    // 简单地兼容了一点HTTPS代理
     let mut peek_buf = [0u8; 1];
 
     let n = conn.peek(&mut peek_buf).await?;
@@ -70,11 +71,9 @@ async fn handle_connection(conn: TcpStream, psk_bytes: [u8; 32]) -> AppResult<()
 
     match peek_buf[0] {
         0x05 => {
-            // SOCKS5 协议的标志
             info!("收到SOCKS5代理连接请求");
             handle_socks5_proxy(conn, &psk_bytes).await
         }
-        // HTTP 协议常见方法的首字母
         b'C' | b'G' | b'P' | b'O' => {
             info!("收到HTTPS代理连接请求");
             handle_http_proxy(conn, &psk_bytes).await
@@ -83,242 +82,6 @@ async fn handle_connection(conn: TcpStream, psk_bytes: [u8; 32]) -> AppResult<()
             Err(format!("未知的协议指纹: 0x{:02x}", peek_buf[0]).into())
         }
     }
-}
-fn generate_nonce_from_counter(counter: u64) -> Nonce {
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
-    Nonce::assume_unique_for_key(nonce_bytes)
-}
-
-async fn write_encrypted_frame(
-    writer: &mut OwnedWriteHalf,
-    key: &LessSafeKey,
-    counter: &mut u64,
-    payload: &[u8],
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    for chunk in payload.chunks(MAX_PAYLOAD_SIZE) {
-        let chunk_len = chunk.len() as u16;
-
-        // 加密并发送长度头部（2字节明文 + 16字节 tag = 18字节密文）
-        let mut len_buf = chunk_len.to_be_bytes().to_vec();
-        let nonce_len = generate_nonce_from_counter(*counter);
-        *counter += 1;
-        key.seal_in_place_append_tag(nonce_len, Aad::empty(), &mut len_buf)
-            .map_err(|_| "长度头部加密失败")?;
-        writer.write_all(&len_buf).await?;
-
-        // 加密并发送实际数据块（N字节明文 + 16字节 tag）
-        let mut payload_buf = chunk.to_vec();
-        let nonce_payload = generate_nonce_from_counter(*counter);
-        *counter += 1;
-        key.seal_in_place_append_tag(nonce_payload, Aad::empty(), &mut payload_buf)
-            .map_err(|_| "数据负载加密失败")?;
-        writer.write_all(&payload_buf).await?;
-    }
-
-    Ok(())
-}
-
-async fn read_encrypted_frame_and_forward(
-    reader: &mut OwnedReadHalf,
-    key: &LessSafeKey,
-    counter: &mut u64,
-    client_writer: &mut OwnedWriteHalf,
-) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    // 读取 18 字节密文长度头部（2字节明文 + 16字节 tag）
-    let mut len_buf = [0u8; 18];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-        Err(e) => return Err(e.into()),
-    }
-
-    let nonce_len = generate_nonce_from_counter(*counter);
-    *counter += 1;
-    let plain_text = key
-        .open_in_place(nonce_len, Aad::empty(), &mut len_buf)
-        .map_err(|_| "头部 AEAD 解密失败")?;
-
-    let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
-
-    // 读取 payload_len + 16 字节密文数据
-    let mut payload_buf = vec![0u8; payload_len as usize + 16];
-    reader.read_exact(&mut payload_buf).await?;
-
-    let nonce_payload = generate_nonce_from_counter(*counter);
-    *counter += 1;
-    let real_payload = key
-        .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
-        .map_err(|_| "负载 AEAD 解密失败")?;
-
-    trace!(bytes = real_payload.len(), "从 VPS 收到数据并转发给客户端");
-    client_writer.write_all(real_payload).await?;
-
-    Ok(true)
-}
-
-async fn read_encrypted_frame(
-    reader: &mut OwnedReadHalf,
-    key: &LessSafeKey,
-    counter: &mut u64,
-) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    let mut len_buf = [0u8; 18];
-    reader.read_exact(&mut len_buf).await?;
-
-    let nonce_len = generate_nonce_from_counter(*counter);
-    *counter += 1;
-    let plain_text = key
-        .open_in_place(nonce_len, Aad::empty(), &mut len_buf)
-        .map_err(|_| "握手阶段 长度头部解密失败")?;
-
-    let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
-
-    let mut payload_buf = vec![0u8; payload_len as usize + 16];
-    reader.read_exact(&mut payload_buf).await?;
-
-    let nonce_payload = generate_nonce_from_counter(*counter);
-    *counter += 1;
-    let real_payload = key
-        .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
-        .map_err(|_| "握手阶段 数据负载解密失败")?;
-
-    Ok(real_payload.to_vec())
-}
-
-async fn perform_handshake(
-    writer: &mut OwnedWriteHalf,
-    reader: &mut OwnedReadHalf,
-    psk_bytes: &[u8; 32],
-) -> Result<LessSafeKey, Box<dyn Error + Send + Sync>> {
-    let psk_unbound = UnboundKey::new(&CHACHA20_POLY1305, psk_bytes)
-        .map_err(|_| "PSK 密钥初始化失败")?;
-    let psk_key = LessSafeKey::new(psk_unbound);
-    let mut handshake_send_counter: u64 = 0;
-    let mut handshake_recv_counter: u64 = 0;
-    
-    let rng = SystemRandom::new();
-    let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
-        .map_err(|_| "生成 X25519 私钥失败")?;
-    let my_public_key = my_private_key
-        .compute_public_key()
-        .map_err(|_| "计算 X25519 公钥失败")?;
-    
-    write_encrypted_frame(writer, &psk_key, &mut handshake_send_counter, my_public_key.as_ref()).await?;
-    
-    let server_pub_key_bytes = read_encrypted_frame(reader, &psk_key, &mut handshake_recv_counter).await?;
-
-    if server_pub_key_bytes.len() != 32 {
-        return Err(format!("服务端返回的公钥长度错误，需要 32 字节，实际为 {} 字节", server_pub_key_bytes.len()).into());
-    }
-
-    let server_public_key = agreement::UnparsedPublicKey::new(&agreement::X25519, server_pub_key_bytes);
-
-    let session_key_bytes: [u8; 32] = agreement::agree_ephemeral(
-        my_private_key, &server_public_key,
-        |key_material: &[u8]| -> Result<[u8; 32], ring::error::Unspecified> {
-            let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, psk_bytes);
-            let prk = salt.extract(key_material);
-
-            let info: &[&[u8]] = &[b"palm-proxy-handshake-phase"];
-            let okm: Okm<HkdfOutputLen> = prk
-                .expand(info, HkdfOutputLen(32))?;
-
-            let mut derived_key = [0u8; 32];
-            okm.fill(&mut derived_key)?;
-
-            Ok(derived_key)
-        },
-    ).flatten().map_err(|_| "ECDH 密钥协商与 HKDF 派生失败")?;
-
-    let final_unbound = UnboundKey::new(&CHACHA20_POLY1305, &session_key_bytes)
-        .map_err(|_| "Session Key 初始化失败")?;
-    Ok(LessSafeKey::new(final_unbound))
-}
-
-pub fn init_tracing() -> WorkerGuard {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,client_ui=debug"));
-
-    let stdout_layer = fmt::layer()
-        .with_ansi(true) // 开启颜色
-        .with_target(true); // 显示模块路径
-
-    let file_appender = tracing_appender::rolling::daily("./logs", "app.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    // 文件层使用 JSON 格式
-    let file_layer = fmt::layer()
-        .with_writer(non_blocking)
-        .json() // 结构化输出
-        .with_ansi(false);
-
-    // 注册所有 Layer
-    Registry::default()
-        .with(env_filter)
-        .with(stdout_layer)
-        .with(file_layer)
-        .init();
-
-    guard
-}
-
-async fn forward_to_vps(
-    client_conn: TcpStream,
-    atyp: u8,
-    addr: String,
-    port: u16,
-    psk_bytes: &[u8; 32]
-) -> AppResult<()> {
-    let vps_addr = env::var("VPS_ADDR")?;
-    let target_conn = TcpStream::connect(&vps_addr).await?;
-    let (mut target_read, mut target_write) = target_conn.into_split();
-
-    let session_key = perform_handshake(&mut target_write, &mut target_read, &psk_bytes).await?;
-    info!("握手完成，开始使用 Session Key 转发数据");
-
-    // 构建并发送自制协议头
-    let addr_bytes = addr.as_bytes();
-    let mut header_buf = Vec::new();
-    header_buf.push(atyp);
-    header_buf.push(addr_bytes.len() as u8);
-    header_buf.extend_from_slice(addr_bytes);
-    header_buf.extend_from_slice(&port.to_be_bytes());
-
-    let mut send_counter: u64 = 0;
-    let mut receive_counter: u64 = 0;
-
-    write_encrypted_frame(&mut target_write, &session_key, &mut send_counter, &header_buf).await?;
-
-    let (mut client_read, mut client_write) = client_conn.into_split();
-
-    // 开启双向加密转发
-    let client_to_target = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    write_encrypted_frame(&mut target_write, &session_key, &mut send_counter, &buf[..n]).await?;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok::<(), Box<dyn Error + Send + Sync>>(())
-    };
-
-    let target_to_client = async {
-        loop {
-            match read_encrypted_frame_and_forward(&mut target_read, &session_key, &mut receive_counter, &mut client_write).await {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok::<(), Box<dyn Error + Send + Sync>>(())
-    };
-
-    tokio::try_join!(client_to_target, target_to_client)?;
-    Ok(())
 }
 
 async fn handle_http_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppResult<()> {
@@ -407,7 +170,7 @@ async fn handle_socks5_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppRe
         }
     };
 
-    // 读取 2 字节的目标端口 (大端序)
+    // 读取 2 字节的目标端口
     let mut port_buf = [0u8; 2];
     conn.read_exact(&mut port_buf).await?;
     let port = u16::from_be_bytes(port_buf);
@@ -420,4 +183,248 @@ async fn handle_socks5_proxy(mut conn: TcpStream, psk_bytes: &[u8; 32]) -> AppRe
     conn.write_all(&reply).await?;
 
     forward_to_vps(conn, atyp, addr, port, psk_bytes).await
+}
+
+fn generate_nonce_from_counter(counter: u64) -> Nonce {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    nonce_bytes[4..12].copy_from_slice(&counter.to_be_bytes());
+    Nonce::assume_unique_for_key(nonce_bytes)
+}
+
+async fn write_encrypted_frame(
+    writer: &mut OwnedWriteHalf,
+    key: &LessSafeKey,
+    counter: &mut u64,
+    payload: &[u8],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for chunk in payload.chunks(MAX_PAYLOAD_SIZE) {
+        let chunk_len = chunk.len() as u16;
+
+        // 加密并发送长度头部（2字节明文 + 16字节 tag = 18字节密文）
+        let mut len_buf = chunk_len.to_be_bytes().to_vec();
+        let nonce_len = generate_nonce_from_counter(*counter);
+        *counter += 1;
+        key.seal_in_place_append_tag(nonce_len, Aad::empty(), &mut len_buf)
+            .map_err(|_| "长度头部加密失败")?;
+        writer.write_all(&len_buf).await?;
+
+        // 加密并发送实际数据块（N字节明文 + 16字节 tag）
+        let mut payload_buf = chunk.to_vec();
+        let nonce_payload = generate_nonce_from_counter(*counter);
+        *counter += 1;
+        key.seal_in_place_append_tag(nonce_payload, Aad::empty(), &mut payload_buf)
+            .map_err(|_| "数据负载加密失败")?;
+        writer.write_all(&payload_buf).await?;
+    }
+
+    Ok(())
+}
+
+async fn read_encrypted_frame_and_forward(
+    reader: &mut OwnedReadHalf,
+    key: &LessSafeKey,
+    counter: &mut u64,
+    client_writer: &mut OwnedWriteHalf,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    // 读取 18 字节密文长度头部（2字节明文 + 16字节 tag）
+    let mut len_buf = [0u8; 18];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+
+    let nonce_len = generate_nonce_from_counter(*counter);
+    *counter += 1;
+    let plain_text = key
+        .open_in_place(nonce_len, Aad::empty(), &mut len_buf)
+        .map_err(|_| "头部 AEAD 解密失败")?;
+
+    let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
+
+    // 读取 payload_len + 16 字节密文数据
+    let mut payload_buf = vec![0u8; payload_len as usize + 16];
+    reader.read_exact(&mut payload_buf).await?;
+
+    let nonce_payload = generate_nonce_from_counter(*counter);
+    *counter += 1;
+    let real_payload = key
+        .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
+        .map_err(|_| "负载 AEAD 解密失败")?;
+
+    trace!(bytes = real_payload.len(), "从 VPS 收到数据并转发给客户端");
+
+    client_writer.write_all(real_payload).await?;
+
+    Ok(true)
+}
+
+async fn read_encrypted_frame(
+    reader: &mut OwnedReadHalf,
+    key: &LessSafeKey,
+    counter: &mut u64,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let mut len_buf = [0u8; 18];
+    reader.read_exact(&mut len_buf).await?;
+
+    let nonce_len = generate_nonce_from_counter(*counter);
+    *counter += 1;
+    let plain_text = key
+        .open_in_place(nonce_len, Aad::empty(), &mut len_buf)
+        .map_err(|_| "握手阶段 长度头部解密失败")?;
+
+    let payload_len = u16::from_be_bytes(plain_text[..2].try_into().unwrap());
+
+    let mut payload_buf = vec![0u8; payload_len as usize + 16];
+    reader.read_exact(&mut payload_buf).await?;
+
+    let nonce_payload = generate_nonce_from_counter(*counter);
+    *counter += 1;
+    let real_payload = key
+        .open_in_place(nonce_payload, Aad::empty(), &mut payload_buf)
+        .map_err(|_| "握手阶段 数据负载解密失败")?;
+
+    Ok(real_payload.to_vec())
+}
+
+async fn perform_handshake(
+    writer: &mut OwnedWriteHalf,
+    reader: &mut OwnedReadHalf,
+    psk_bytes: &[u8; 32],
+) -> Result<LessSafeKey, Box<dyn Error + Send + Sync>> {
+    let psk_unbound = UnboundKey::new(&CHACHA20_POLY1305, psk_bytes)
+        .map_err(|_| "PSK 密钥初始化失败")?;
+    let psk_key = LessSafeKey::new(psk_unbound);
+    let mut handshake_send_counter: u64 = 0;
+    let mut handshake_recv_counter: u64 = 0;
+    
+    let rng = SystemRandom::new();
+    let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+        .map_err(|_| "生成 X25519 私钥失败")?;
+    let my_public_key = my_private_key
+        .compute_public_key()
+        .map_err(|_| "计算 X25519 公钥失败")?;
+    
+    write_encrypted_frame(writer, &psk_key, &mut handshake_send_counter, my_public_key.as_ref()).await?;
+    
+    let server_pub_key_bytes = read_encrypted_frame(reader, &psk_key, &mut handshake_recv_counter).await?;
+
+    if server_pub_key_bytes.len() != 32 {
+        return Err(format!("服务端返回的公钥长度错误，需要 32 字节，实际为 {} 字节", server_pub_key_bytes.len()).into());
+    }
+
+    let server_public_key = agreement::UnparsedPublicKey::new(&agreement::X25519, server_pub_key_bytes);
+
+    let session_key_bytes: [u8; 32] = agreement::agree_ephemeral(
+        my_private_key, &server_public_key,
+        |key_material: &[u8]| -> Result<[u8; 32], ring::error::Unspecified> {
+            let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, psk_bytes);
+            let prk = salt.extract(key_material);
+
+            let info: &[&[u8]] = &[b"palm-proxy-handshake-phase"];
+            let okm: Okm<HkdfOutputLen> = prk
+                .expand(info, HkdfOutputLen(32))?;
+
+            let mut derived_key = [0u8; 32];
+            okm.fill(&mut derived_key)?;
+
+            Ok(derived_key)
+        },
+    ).flatten().map_err(|_| "ECDH 密钥协商与 HKDF 派生失败")?;
+
+    let final_unbound = UnboundKey::new(&CHACHA20_POLY1305, &session_key_bytes)
+        .map_err(|_| "Session Key 初始化失败")?;
+    Ok(LessSafeKey::new(final_unbound))
+}
+
+async fn forward_to_vps(
+    client_conn: TcpStream,
+    atyp: u8,
+    addr: String,
+    port: u16,
+    psk_bytes: &[u8; 32]
+) -> AppResult<()> {
+    let vps_addr = env::var("VPS_ADDR")?;
+    let target_conn = TcpStream::connect(&vps_addr).await?;
+    let (mut target_read, mut target_write) = target_conn.into_split();
+
+    let session_key = perform_handshake(&mut target_write, &mut target_read, &psk_bytes).await?;
+    info!("握手完成，开始使用 Session Key 转发数据");
+
+    // 构建并发送自制协议头
+    /* 协议头格式：
+     * 1 byte:  地址类型 (0x01=IPv4, 0x03=域名, 0x04=IPv6)
+     * 1 byte:  地址长度
+     * N bytes: 地址
+     * 2 bytes: 端口
+     */
+    let addr_bytes = addr.as_bytes();
+    let mut header_buf = Vec::new();
+    header_buf.push(atyp);
+    header_buf.push(addr_bytes.len() as u8);
+    header_buf.extend_from_slice(addr_bytes);
+    header_buf.extend_from_slice(&port.to_be_bytes());
+
+    let mut send_counter: u64 = 0;
+    let mut receive_counter: u64 = 0;
+
+    write_encrypted_frame(&mut target_write, &session_key, &mut send_counter, &header_buf).await?;
+
+    let (mut client_read, mut client_write) = client_conn.into_split();
+
+    // 开启双向加密转发
+    let client_to_target = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    write_encrypted_frame(&mut target_write, &session_key, &mut send_counter, &buf[..n]).await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    };
+
+    let target_to_client = async {
+        loop {
+            match read_encrypted_frame_and_forward(&mut target_read, &session_key, &mut receive_counter, &mut client_write).await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    };
+
+    tokio::try_join!(client_to_target, target_to_client)?;
+    Ok(())
+}
+
+fn init_tracing() -> WorkerGuard {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,client_ui=debug"));
+
+    let stdout_layer = fmt::layer()
+        .with_ansi(true) // 开启颜色
+        .with_target(true); // 显示模块路径
+
+    let file_appender = tracing_appender::rolling::daily("./logs", "app.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // 文件层使用 JSON 格式
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .json() // 结构化输出
+        .with_ansi(false);
+
+    // 注册所有 Layer
+    Registry::default()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+
+    guard
 }

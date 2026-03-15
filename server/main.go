@@ -24,7 +24,7 @@ import (
  * 1 byte:  地址类型 (0x01=IPv4, 0x03=域名, 0x04=IPv6)
  * 1 byte:  地址长度
  * N bytes: 地址
- * 2 bytes: 端口 (大端序)
+ * 2 bytes: 端口
  */
 
 const (
@@ -310,6 +310,7 @@ func performHandshake(conn net.Conn, psk []byte) (cipher.AEAD, error) {
 
 	return chacha20poly1305.New(sessionKey)
 }
+
 func initLogger() {
 	fileWriter := &lumberjack.Logger{
 		Filename:   "/var/log/vps_proxy.log", // 日志文件路径
